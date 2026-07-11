@@ -1,0 +1,12 @@
+torch>=2.1.0
+torchvision
+torchaudio
+opencv-python-headless
+retinaface
+sam2 @ git+https://github.com/facebookresearch/segment-anything-2.git
+diffusers
+transformers
+insightface
+onnxruntime-gpu
+accelerate
+pillow
