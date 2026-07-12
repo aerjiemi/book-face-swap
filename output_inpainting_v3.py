@@ -1,46 +1,65 @@
 """
-Этап 3 пайплайна, ВАРИАНТ 3: двухэтапный пайплайн (коллаж -> инпейнт + ControlNet).
+Этап 3 пайплайна, ВАРИАНТ 3.1: двухэтапный пайплайн (коллаж -> инпейнт + ControlNet).
 
-За основу взята версия "до" (обычный IP-Adapter FaceID, без PlusV2):
-она стабильно рисовала лицо, проблема была только с волосами.
+Изменения относительно v3 (по итогам тестов на 3090/4090):
 
-Как работает:
-1) КОЛЛАЖ (hair_collage.py):
-   - волосы клиента сегментируются face-parsing'ом и вырезаются с его фото;
-   - голова клиента выравнивается к голове персонажа по 5 точкам лица
-     (similarity: масштаб+поворот+сдвиг);
-   - исходные лицо+волосы персонажа затираются (cv2.inpaint), чтобы старая
-     причёска персонажа не "просачивалась" через ControlNet;
-   - волосы клиента (фото-пиксели) вклеиваются поверх.
-   Теперь ГЕОМЕТРИЯ и ЦВЕТ причёски заданы жёстко — их не надо "угадывать".
+1) IP-Adapter FaceID -> FaceID Plus V2 (ip-adapter-faceid-plusv2_sdxl).
+   Кроме ArcFace-эмбеддинга в модель подаётся CLIP-эмбеддинг выровненного
+   кропа лица клиента. Это главное лекарство от "слишком детское /
+   вытянутое / не похоже": ArcFace кодирует identity, но плохо переносит
+   возраст, пол и пропорции головы — CLIP-ветка Plus V2 это добирает.
+   Откат на старое поведение: --faceid v1.
 
-2) ИНПЕЙНТ: SDXL-inpaint + IP-Adapter FaceID (v1, только ArcFace)
-   + ControlNet Tile (xinsir) с малым весом (по умолчанию 0.35) на всю зону.
-   - базовое изображение и control image = коллаж;
-   - маска инпейнта = затёртая зона + вклеенные волосы (+ запас на швы);
-   - strength=0.99: зона перерисовывается полностью, но ControlNet Tile
-     удерживает форму/цвет вклеенных волос, а стиль (мазки, палитра)
-     задаётся промптом и style LoRA. Лицо ControlNet почти не ограничивает
-     (в коллаже там затёртое пятно) — его рисует FaceID.
+2) Авто-описание клиента в промпте: InsightFace (buffalo_l) отдаёт пол и
+   примерный возраст -> в промпт подставляется "35 year old man" и т.п.,
+   для взрослых в negative добавляется "child, baby face, ...".
+   Переопределить: --person "40 year old bearded man"; отключить: --person "".
 
-3) Отбор: несколько seed, лучший по ArcFace-сходству с клиентом.
-   best.png / candidate_<seed>.png / grid.jpg / collage.png /
-   inpaint_mask.png / result.json
+3) Фикс "нимба" вокруг головы. Раньше маска ГЕНЕРАЦИИ (расширенная на
+   seam_dilate) использовалась и для финальной ВКЛЕЙКИ — кольцо
+   перегенерированного фона (чуть другого цвета) вклеивалось поверх
+   оригинала и было видно как ореол. Теперь маски разведены:
+     - генерация: регион + seam_dilate (модели нужен запас на швы);
+     - вклейка:   регион + paste_dilate (по умолчанию 6px, почти впритык).
+   Фон вокруг головы в итоговой картинке — всегда оригинальные пиксели.
 
-Запуск (RTX 5050 8GB: работает через cpu-offload, медленно; на 4090 быстро):
+4) Промпт: убран конфликт "clear smooth skin" (positive) vs "smooth skin"
+   (negative), в negative добавлены анти-"вытянутое лицо" токены.
+   control_scale по умолчанию 0.28 -> 0.35: живописное лицо персонажа в
+   коллаже через ControlNet Tile держит ПРОПОРЦИИ головы, а ЧЕРТЫ лица
+   задаёт FaceID.
+
+5) --base-model: другой SDXL-чекпоинт вместо diffusers/sdxl-inpainting
+   (например RunDiffusion/Juggernaut-XL-v9 или SG161222/RealVisXL_V5.0).
+   Pipeline умеет инпейнтить и обычным (не-inpaint) UNet. ВНИМАНИЕ:
+   фотореалистичные чекпоинты рисуют лица структурно лучше, но тянут
+   в фотореализм против иллюстративного стиля — проверять глазами.
+
+6) На GPU с >=18GB VRAM (3090/4090) пайплайн грузится целиком на CUDA
+   (быстро); cpu-offload включается автоматически только на малых картах.
+
+Запуск:
   python output_inpainting_v3.py --image data/illustrations/spread_01.png \
       --client data/clients/ivan.jpg --hair "long wavy blonde hair"
 
+  # сравнить со старым FaceID v1:
+  python output_inpainting_v3.py ... --faceid v1
+
+  # попробовать другой базовый чекпоинт:
+  python output_inpainting_v3.py ... --base-model RunDiffusion/Juggernaut-XL-v9
+
   --hair          текст про причёску (англ.) — опционально, но помогает;
-  --control-scale вес ControlNet Tile (0.3..0.45); больше = точнее форма
-                  волос, но фактура остаётся "фотографичной";
-  --paste-face    вклеивать в коллаж и лицо клиента (эксперимент);
-  --gen-size 768  если на 8GB ловите OOM (1024 по умолчанию — SDXL обучен
-                  на 1024, на 512 лица получаются кривыми, это и сломало
-                  прошлую версию).
+  --person        описание клиента для промпта (по умолчанию авто по
+                  возрасту/полу из InsightFace; --person "" отключает);
+  --control-scale вес ControlNet Tile (0.3..0.5); больше = точнее форма
+                  волос и пропорции лица, но фактура "фотографичнее";
+  --paste-dilate  запас вклейки в px (кроп gen_size); больше = мягче шов,
+                  но возвращается риск "нимба";
+  --gen-size 768  при OOM на 8GB (1024 по умолчанию — SDXL обучен на 1024).
 
 !!! Требует предрасчитанной маски (illustrations_mask.py).
-Первый запуск докачает ControlNet Tile (~2.5GB) и face-parsing (~340MB).
+Первый запуск докачает: ControlNet Tile (~2.5GB), face-parsing (~340MB),
+IP-Adapter FaceID PlusV2 (~1.3GB), CLIP image encoder ViT-H (~2.5GB).
 """
 
 from __future__ import annotations
@@ -63,23 +82,32 @@ OUTPUTS_DIR = PROJECT_ROOT / "data" / "outputs"
 
 SDXL_INPAINT_ID = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 CONTROLNET_TILE_ID = "xinsir/controlnet-tile-sdxl-1.0"
+
 FACEID_REPO = "h94/IP-Adapter-FaceID"
-FACEID_WEIGHTS = "ip-adapter-faceid_sdxl.bin"          # обычный FaceID (v1)
-FACEID_LORA = "ip-adapter-faceid_sdxl_lora.safetensors"
+FACEID_V1_WEIGHTS = "ip-adapter-faceid_sdxl.bin"
+FACEID_V1_LORA = "ip-adapter-faceid_sdxl_lora.safetensors"
+FACEID_V2_WEIGHTS = "ip-adapter-faceid-plusv2_sdxl.bin"
+FACEID_V2_LORA = "ip-adapter-faceid-plusv2_sdxl_lora.safetensors"
+# CLIP-энкодер для CLIP-ветки Plus V2 (ViT-H, тот же, что у обычного IP-Adapter)
+IMAGE_ENCODER_REPO = "h94/IP-Adapter"
+IMAGE_ENCODER_SUBFOLDER = "models/image_encoder"
 
 CROP_MARGIN = 0.4   # запас контекста вокруг зоны инпейнта (доля от её размера)
 
+# {person} подставляется в main (авто по возрасту/полу либо --person)
 DEFAULT_PROMPT = (
-    "oil painting portrait of a person, painted in the same style as the artwork, "
-    "visible brush strokes, thick impasto, textured painterly skin, "
+    "painted portrait of a {person}, in the exact art style of the artwork, "
+    "visible brush strokes, illustration, highly detailed face and eyes, "
+    "correct natural facial proportions, "
+    "perfect accurate likeness of the reference face, "
     "hair shape and hair color exactly as in the image, "
-    "accurate likeness of the reference face, "
-    "palette consistent with the artwork, seamlessly integrated into the scene"
+    "seamlessly integrated into the scene"
 )
 DEFAULT_NEGATIVE = (
     "photo, photorealistic, photographic skin, photographic hair texture, "
     "smooth skin, airbrushed, plastic skin, 3d render, vector, flat shading, "
-    "deformed, blurry, low quality, extra eyes, bad anatomy, "
+    "elongated face, long face, narrow face, distorted proportions, "
+    "deformed, blurry, low quality, extra eyes, bad anatomy, cross-eyed, "
     "text, watermark, different person, generic face"
 )
 
@@ -90,17 +118,21 @@ DEFAULT_NEGATIVE = (
 class InpaintConfig:
     lora_path: str | None = None   # путь к style LoRA
     lora_scale: float = 0.5
-    ip_scale: float = 0.8          # сила identity (FaceID), 0.6..1.0; ниже = меньше "пластика"
-    faceid_lora_scale: float = 0.6 # вес вспомогательной LoRA FaceID (была захардкожена 1.0)
-    control_scale: float = 0.45    # вес ControlNet Tile, 0.35..0.55; выше = больше мазков/структуры
-    strength: float = 0.99         # 1.0 = полностью перерисовать зону
+    ip_scale: float = 1.0          # сила identity (FaceID), 0.6..1.0
+    faceid_lora_scale: float = 0.9 # вес вспомогательной LoRA FaceID
+    control_scale: float = 0.35    # вес ControlNet Tile, 0.3..0.5
+    strength: float = 0.86         # 1.0 = полностью перерисовать зону
     steps: int = 30
-    guidance: float = 5.0
+    guidance: float = 4.5
     seeds: int = 3                 # сколько кандидатов сгенерировать
     base_seed: int = 42
     gen_size: int = 1024           # рабочее разрешение (SDXL обучен на 1024!)
-    mask_blur: int = 8             # размытие краёв маски (px в кропе gen_size)
-    seam_dilate: int = 16          # запас маски на швы (px в кропе gen_size)
+    mask_blur: int = 12            # размытие краёв масок (px в кропе gen_size)
+    seam_dilate: int = 28          # запас маски ГЕНЕРАЦИИ на швы (px, gen_size)
+    paste_dilate: int = 6          # запас маски ВКЛЕЙКИ (px, gen_size). Мало
+                                   # = нет "нимба"; много = мягче шов, но ореол
+    faceid_version: str = "plusv2" # "plusv2" | "v1"
+    base_model: str | None = None  # другой SDXL-чекпоинт вместо inpaint
     prompt: str = DEFAULT_PROMPT
     negative: str = DEFAULT_NEGATIVE
 
@@ -111,28 +143,106 @@ CFG = InpaintConfig()
 # ----------------------------- identity-embedding ----------------------------
 
 def build_face_analyzer():
-    """InsightFace buffalo_l: детекция + ArcFace-эмбеддинг."""
+    """InsightFace buffalo_l: детекция + ArcFace-эмбеддинг + пол/возраст."""
     from insightface.app import FaceAnalysis
     providers = (
         ["CUDAExecutionProvider", "CPUExecutionProvider"]
         if torch.cuda.is_available() else ["CPUExecutionProvider"]
     )
     app = FaceAnalysis(name="buffalo_l", providers=providers)
-    app.prepare(ctx_id=0, det_size=(640, 640))
+    app.prepare(ctx_id=0, det_size=(1024, 1024), det_thresh=0.3)
     return app
 
 
 def client_face(app, photo_path: Path):
-    """Крупнейшее лицо на фото клиента (kps нужны для выравнивания коллажа)."""
-    img = cv2.imread(str(photo_path))
+    """Крупнейшее лицо на фото клиента (с авто-фиксами поворота и сверхкрупного плана).
+
+    Фото клиента по продукту всегда крупноплановое и качественное: обычная
+    детекция на det_size=1024 срабатывает почти всегда; фолбэки ниже
+    закрывают редкий случай ЭКСТРЕМАЛЬНО крупного плана (лицо на весь кадр).
+    """
+    from PIL import ImageOps
+
+    # 1. Загрузка изображения с исправлением поворота EXIF (телефонные фото)
+    try:
+        img_pil = Image.open(photo_path)
+        img_pil = ImageOps.exif_transpose(img_pil)
+        img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    except Exception:
+        img = cv2.imread(str(photo_path))
+
     if img is None:
         raise ValueError(f"Не удалось прочитать фото клиента: {photo_path}")
+
+    # 2. Первая попытка детекции (в лоб)
     faces = app.get(img)
+
+    # 3. Если лицо НЕ найдено — гипотеза "сверхкрупного плана" (добавляем поля)
     if not faces:
-        raise ValueError(f"На фото клиента не найдено лицо: {photo_path}.")
+        print("[ИНФО] Лицо не найдено. Возможно, оно слишком крупное. "
+              "Искусственно расширяем границы...")
+        h, w = img.shape[:2]
+        pad_h, pad_w = int(h * 0.25), int(w * 0.25)
+        img_padded = cv2.copyMakeBorder(
+            img, pad_h, pad_h, pad_w, pad_w,
+            cv2.BORDER_CONSTANT, value=[0, 0, 0]
+        )
+        faces = app.get(img_padded)
+        if faces:
+            print("[УСПЕХ] Лицо обнаружено после добавления полей!")
+            img = img_padded  # чтобы ключевые точки совпали с картинкой
+        else:
+            print("[ИНФО] Поля не сработали. Пробуем экстремальное сжатие "
+                  "для детектора...")
+            old_det_size = app.det_size
+            app.prepare(ctx_id=0, det_size=(320, 320), det_thresh=0.2)
+            faces = app.get(img)
+            app.prepare(ctx_id=0, det_size=old_det_size, det_thresh=0.3)
+
+    if not faces:
+        raise ValueError(
+            f"На фото клиента не найдено лицо (даже после авто-фиксов): {photo_path}."
+        )
+
     faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
                reverse=True)
     return img, faces[0]
+
+
+def person_descriptor(face) -> tuple[str, str]:
+    """"35 year old man" по атрибутам InsightFace + доп. negative-токены.
+
+    Возраст buffalo_l оценивает грубо (+-5..7 лет) — этого достаточно, чтобы
+    оттащить SDXL от дефолтного "молодого generic-лица". Точное описание
+    всегда можно задать через --person.
+    """
+    age = getattr(face, "age", None)
+    sex = getattr(face, "sex", None)
+    if age is None or sex is None:
+        return "person", ""
+    age = int(age)
+    male = str(sex).upper().startswith("M")
+
+    if age < 4:
+        noun = "toddler boy" if male else "toddler girl"
+        desc = noun
+    elif age < 13:
+        noun = "boy" if male else "girl"
+        desc = f"{age} year old {noun}"
+    elif age < 20:
+        noun = "teenage boy" if male else "teenage girl"
+        desc = f"{age} year old {noun}"
+    else:
+        noun = "man" if male else "woman"
+        desc = f"{age} year old {noun}"
+
+    if age >= 20:
+        extra_neg = "child, kid, teenager, childlike face, baby face, chibi"
+    elif age < 13:
+        extra_neg = "adult, elderly, wrinkles, facial hair"
+    else:
+        extra_neg = ""
+    return desc, extra_neg
 
 
 def face_similarity(app, image_bgr: np.ndarray, ref_embed: np.ndarray) -> float:
@@ -172,7 +282,7 @@ def dilate_px(mask: np.ndarray, px: int) -> np.ndarray:
 # ----------------------------- pipeline --------------------------------------
 
 def build_pipeline(device: str, cfg: InpaintConfig):
-    """SDXL-inpaint + ControlNet Tile + IP-Adapter FaceID (v1)."""
+    """SDXL(-inpaint) + ControlNet Tile + IP-Adapter FaceID (v1 или PlusV2)."""
     from diffusers import ControlNetModel, StableDiffusionXLControlNetInpaintPipeline
 
     dtype = torch.float16 if device == "cuda" else torch.float32
@@ -181,41 +291,91 @@ def build_pipeline(device: str, cfg: InpaintConfig):
     controlnet = ControlNetModel.from_pretrained(CONTROLNET_TILE_ID,
                                                  torch_dtype=dtype)
 
-    print(f"Загрузка SDXL inpaint: {SDXL_INPAINT_ID}")
-    pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
-        SDXL_INPAINT_ID, controlnet=controlnet, torch_dtype=dtype,
-        variant="fp16" if device == "cuda" else None,
-    )
+    # для PlusV2 нужен CLIP image encoder (CLIP-ветка identity)
+    extra = {}
+    if cfg.faceid_version == "plusv2":
+        from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+        print(f"Загрузка CLIP image encoder: "
+              f"{IMAGE_ENCODER_REPO}/{IMAGE_ENCODER_SUBFOLDER}")
+        extra["image_encoder"] = CLIPVisionModelWithProjection.from_pretrained(
+            IMAGE_ENCODER_REPO, subfolder=IMAGE_ENCODER_SUBFOLDER,
+            torch_dtype=dtype)
+        extra["feature_extractor"] = CLIPImageProcessor()
 
-    print(f"Загрузка IP-Adapter FaceID: {FACEID_REPO}/{FACEID_WEIGHTS}")
+    base_id = cfg.base_model or SDXL_INPAINT_ID
+    print(f"Загрузка базовой модели: {base_id}")
+    try:
+        pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
+            base_id, controlnet=controlnet, torch_dtype=dtype,
+            variant="fp16" if device == "cuda" else None, **extra)
+    except (OSError, ValueError, EnvironmentError):
+        # у многих кастомных чекпоинтов нет fp16-варианта весов
+        pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
+            base_id, controlnet=controlnet, torch_dtype=dtype, **extra)
+
+    if cfg.faceid_version == "plusv2":
+        weights, lora = FACEID_V2_WEIGHTS, FACEID_V2_LORA
+    else:
+        weights, lora = FACEID_V1_WEIGHTS, FACEID_V1_LORA
+
+    print(f"Загрузка IP-Adapter FaceID ({cfg.faceid_version}): "
+          f"{FACEID_REPO}/{weights}")
     pipe.load_ip_adapter(FACEID_REPO, subfolder=None,
-                         weight_name=FACEID_WEIGHTS, image_encoder_folder=None)
+                         weight_name=weights, image_encoder_folder=None)
 
-    adapters, weights = [], []
-    pipe.load_lora_weights(FACEID_REPO, weight_name=FACEID_LORA,
-                           adapter_name="faceid")
-    adapters.append("faceid"); weights.append(cfg.faceid_lora_scale)
+    adapters, adapter_weights = [], []
+    pipe.load_lora_weights(FACEID_REPO, weight_name=lora, adapter_name="faceid")
+    adapters.append("faceid"); adapter_weights.append(cfg.faceid_lora_scale)
 
     if cfg.lora_path:
         print(f"Загрузка style LoRA: {cfg.lora_path} (scale={cfg.lora_scale})")
         pipe.load_lora_weights(cfg.lora_path, adapter_name="style")
-        adapters.append("style"); weights.append(cfg.lora_scale)
+        adapters.append("style"); adapter_weights.append(cfg.lora_scale)
 
-    pipe.set_adapters(adapters, adapter_weights=weights)
+    pipe.set_adapters(adapters, adapter_weights=adapter_weights)
 
     if device == "cuda":
-        pipe.enable_model_cpu_offload()   # критично для 8GB VRAM
-        pipe.enable_vae_tiling()
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 2 ** 30
+        if total_gb >= 18:          # 3090/4090 и крупнее — всё на GPU, быстро
+            print(f"VRAM {total_gb:.0f}GB: пайплайн целиком на CUDA.")
+            pipe.to("cuda")
+        else:                        # 8-16GB — офлоад, медленно, но работает
+            print(f"VRAM {total_gb:.0f}GB: включаю cpu-offload + vae tiling.")
+            pipe.enable_model_cpu_offload()
+            pipe.enable_vae_tiling()
     else:
         pipe.to("cpu")
     return pipe
 
 
 def faceid_embeds_for_pipe(embed: np.ndarray, device: str, dtype) -> torch.Tensor:
-    """ArcFace-эмбеддинг -> формат ip_adapter_image_embeds."""
+    """ArcFace-эмбеддинг -> формат ip_adapter_image_embeds (для v1 и PlusV2)."""
     pos = torch.from_numpy(embed).reshape(1, 1, -1)
     neg = torch.zeros_like(pos)
     return torch.cat([neg, pos], dim=0).to(device=device, dtype=dtype)
+
+
+def setup_faceid_plusv2(pipe, client_bgr: np.ndarray, cface,
+                        device: str, dtype) -> None:
+    """CLIP-ветка FaceID Plus V2: эмбеддинг выровненного кропа лица клиента.
+
+    Кроп 224x224 делается стандартным ArcFace-выравниванием по 5 точкам
+    (insightface.face_align), прогоняется через CLIP ViT-H и кладётся в
+    projection layer адаптера (механика из официальной документации diffusers).
+    """
+    from insightface.utils import face_align
+
+    crop_bgr = face_align.norm_crop(
+        client_bgr, landmark=cface.kps.astype(np.float32), image_size=224)
+    pil_face = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
+
+    clip_embeds = pipe.prepare_ip_adapter_image_embeds(
+        [pil_face], None, torch.device(device), 1, True)[0]
+
+    proj = pipe.unet.encoder_hid_proj.image_projection_layers[0]
+    proj.clip_embeds = clip_embeds.to(device=device, dtype=dtype)
+    proj.shortcut = True  # True = именно Plus V2
+    print("FaceID Plus V2: CLIP-эмбеддинг лица клиента подготовлен.")
 
 
 # ----------------------------- visualization ---------------------------------
@@ -248,19 +408,35 @@ def make_grid(candidates: list[dict], crop_box, out_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Вариант 3: коллаж волос клиента + SDXL inpaint "
-                    "(IP-Adapter FaceID v1 + ControlNet Tile).")
+        description="Вариант 3.1: коллаж волос клиента + SDXL inpaint "
+                    "(IP-Adapter FaceID PlusV2 + ControlNet Tile).")
     parser.add_argument("--image", required=True, help="Иллюстрация.")
     parser.add_argument("--client", required=True, help="Фото клиента.")
     parser.add_argument("--hair", default="",
                         help="Описание причёски (англ.), напр. 'long wavy "
                              "blonde hair'. Опционально, но помогает.")
+    parser.add_argument("--person", default=None,
+                        help="Описание клиента для промпта, напр. '40 year "
+                             "old bearded man'. По умолчанию — авто по "
+                             "возрасту/полу из InsightFace; --person '' "
+                             "отключает подстановку.")
+    parser.add_argument("--faceid", default=None, choices=["v1", "plusv2"],
+                        help="Версия IP-Adapter FaceID (default: plusv2).")
+    parser.add_argument("--base-model", default=None,
+                        help="Другой SDXL-чекпоинт, напр. "
+                             "RunDiffusion/Juggernaut-XL-v9 или "
+                             "SG161222/RealVisXL_V5.0. По умолчанию "
+                             "diffusers/sdxl-inpainting.")
     parser.add_argument("--seeds", type=int, default=None)
     parser.add_argument("--ip-scale", type=float, default=None)
     parser.add_argument("--faceid-lora-scale", type=float, default=None,
                         help="Вес вспомогательной LoRA FaceID (0.5..1.0).")
     parser.add_argument("--control-scale", type=float, default=None,
-                        help="Вес ControlNet Tile (0.35..0.55).")
+                        help="Вес ControlNet Tile (0.3..0.5).")
+    parser.add_argument("--paste-dilate", type=int, default=None,
+                        help="Запас маски ВКЛЕЙКИ в px кропа gen_size "
+                             "(default 6). Большие значения возвращают "
+                             "'нимб' вокруг головы.")
     parser.add_argument("--gen-size", type=int, default=None,
                         help="Рабочее разрешение (1024; 768 при OOM на 8GB).")
     parser.add_argument("--paste-face", action="store_true",
@@ -278,14 +454,18 @@ def main() -> None:
         overrides["faceid_lora_scale"] = args.faceid_lora_scale
     if args.control_scale is not None:
         overrides["control_scale"] = args.control_scale
+    if args.paste_dilate is not None:
+        overrides["paste_dilate"] = args.paste_dilate
     if args.gen_size is not None:
         overrides["gen_size"] = args.gen_size
+    if args.faceid is not None:
+        overrides["faceid_version"] = args.faceid
+    if args.base_model is not None:
+        overrides["base_model"] = args.base_model
     if args.lora is not None:
         overrides["lora_path"] = args.lora
     if args.lora_scale is not None:
         overrides["lora_scale"] = args.lora_scale
-    if args.hair.strip():
-        overrides["prompt"] = f"{CFG.prompt}, {args.hair.strip()}"
     cfg = dataclasses.replace(CFG, **overrides)
 
     image_path = Path(args.image)
@@ -307,6 +487,22 @@ def main() -> None:
     ref_embed = cface.normed_embedding.astype(np.float32)
     print(f"Эмбеддинг клиента получен ({client_path.name}).")
 
+    # --- промпт: возраст/пол клиента ---
+    if args.person is not None:
+        person_desc = args.person.strip() or "person"
+        extra_neg = ""
+        if args.person.strip():
+            print(f"Описание клиента (из --person): '{person_desc}'")
+    else:
+        person_desc, extra_neg = person_descriptor(cface)
+        print(f"Авто-описание клиента: '{person_desc}' "
+              f"(переопределить: --person).")
+    prompt = cfg.prompt.replace("{person}", person_desc)
+    if args.hair.strip():
+        prompt = f"{prompt}, {args.hair.strip()}"
+    negative = cfg.negative + (f", {extra_neg}" if extra_neg else "")
+    cfg = dataclasses.replace(cfg, prompt=prompt, negative=negative)
+
     # --- иллюстрация + маска ---
     illus_bgr = cv2.imread(str(image_path))
     mask_full = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
@@ -325,28 +521,31 @@ def main() -> None:
           f"лицо-персонажа сохранено: {col.face_preserved}, "
           f"метод затирания волос: {col.wipe_method}).")
 
-    # маска инпейнта = регион головы (лицо+волосы+волосы клиента).
-    # Вариант B: живописное лицо персонажа под маской СОХРАНЕНО в коллаже и
-    # уходит в ControlNet Tile как texture-reference — поэтому перерисованное
-    # лицо остаётся в мазках, а не превращается в гладкий "пластик".
-    inpaint_full = col.inpaint_region.copy()
+    inpaint_region = col.inpaint_region.copy()
 
-    # кроп считаем по этой маске: длинные волосы клиента должны попасть в кроп
-    x1, y1, x2, y2 = mask_crop_box(inpaint_full, CROP_MARGIN, img_w, img_h)
+    # кроп считаем по региону головы: длинные волосы клиента попадают в кроп
+    x1, y1, x2, y2 = mask_crop_box(inpaint_region, CROP_MARGIN, img_w, img_h)
     side = x2 - x1
     print(f"Кроп вокруг зоны: [{x1},{y1},{x2},{y2}] ({side}px) -> {cfg.gen_size}px")
 
-    # запас на швы (задан в px кропа gen_size, пересчёт в масштаб кропа)
-    seam = max(1, round(cfg.seam_dilate * side / cfg.gen_size))
-    inpaint_full = dilate_px(inpaint_full, seam)
+    # ДВЕ маски (фикс "нимба"):
+    #   gen_mask   — что перерисовывает модель (широкий запас на швы);
+    #   paste_mask — что вклеиваем в оригинал (почти впритык к голове).
+    # Кольцо перегенерированного фона между ними ОТБРАСЫВАЕТСЯ — вокруг
+    # головы остаются оригинальные пиксели иллюстрации.
+    gen_seam = max(1, round(cfg.seam_dilate * side / cfg.gen_size))
+    paste_seam = max(0, round(cfg.paste_dilate * side / cfg.gen_size))
+    gen_mask_full = dilate_px(inpaint_region, gen_seam)
+    paste_mask_full = dilate_px(inpaint_region, paste_seam)
 
-    crop_mask = inpaint_full[y1:y2, x1:x2]
+    crop_gen_mask = gen_mask_full[y1:y2, x1:x2]
+    crop_paste_mask = paste_mask_full[y1:y2, x1:x2]
     crop_collage = col.collage_bgr[y1:y2, x1:x2]
 
     gs = cfg.gen_size
     crop_rgb = cv2.resize(cv2.cvtColor(crop_collage, cv2.COLOR_BGR2RGB),
                           (gs, gs), interpolation=cv2.INTER_LANCZOS4)
-    mask_gs = cv2.resize(crop_mask, (gs, gs), interpolation=cv2.INTER_NEAREST)
+    mask_gs = cv2.resize(crop_gen_mask, (gs, gs), interpolation=cv2.INTER_NEAREST)
     if cfg.mask_blur > 0:
         k = cfg.mask_blur * 2 + 1
         mask_gs = cv2.GaussianBlur(mask_gs, (k, k), 0)
@@ -358,15 +557,21 @@ def main() -> None:
     # ====================== ЭТАП 2: ИНПЕЙНТ + CONTROLNET =====================
     pipe = build_pipeline(device, cfg)
     pipe.set_ip_adapter_scale(cfg.ip_scale)
+    if cfg.faceid_version == "plusv2":
+        setup_faceid_plusv2(pipe, client_bgr, cface, device, dtype)
     id_embeds = faceid_embeds_for_pipe(ref_embed, device, dtype)
 
     out_dir = OUTPUTS_DIR / f"{stem}__{client_path.stem}"
     out_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_dir / "collage.png"), col.collage_bgr)
-    cv2.imwrite(str(out_dir / "inpaint_mask.png"), inpaint_full)
+    cv2.imwrite(str(out_dir / "inpaint_mask.png"), gen_mask_full)
+    cv2.imwrite(str(out_dir / "paste_mask.png"), paste_mask_full)
 
-    # мягкая альфа для финальной вклейки (композим на ОРИГИНАЛ иллюстрации)
-    alpha_full = cv2.GaussianBlur(crop_mask, (2 * cfg.mask_blur + 1,) * 2, 0)
+    # мягкая альфа для финальной вклейки — по УЗКОЙ paste-маске, размытие
+    # пересчитано из px gen_size в px кропа (раньше не масштабировалось)
+    blur_px = max(1, round(cfg.mask_blur * side / cfg.gen_size))
+    kb = 2 * blur_px + 1
+    alpha_full = cv2.GaussianBlur(crop_paste_mask, (kb, kb), 0)
     alpha_full = (alpha_full.astype(np.float32) / 255.0)[..., None]
 
     candidates = []
@@ -389,7 +594,8 @@ def main() -> None:
             height=gs, width=gs,
         ).images[0]
 
-        # кроп gen_size -> обратно в размер кропа -> мягкая вклейка по маске
+        # кроп gen_size -> обратно в размер кропа -> мягкая вклейка по
+        # УЗКОЙ маске на ОРИГИНАЛ иллюстрации (фон вокруг головы не трогаем)
         gen_bgr = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
         gen_bgr = cv2.resize(gen_bgr, (side, side), interpolation=cv2.INTER_LANCZOS4)
         composed = illus_bgr.copy()
@@ -415,7 +621,7 @@ def main() -> None:
         print("\n[!] ВНИМАНИЕ: на лучшем кандидате лицо почти/совсем не "
               "детектируется (similarity низкий). Вероятно лицо слилось с "
               "фоном/потеряло структуру. Попробуйте усилить якорь лица:\n"
-              "    --control-scale 0.6  (Tile сильнее держит структуру лица)\n"
+              "    --control-scale 0.5  (Tile сильнее держит структуру лица)\n"
               "    --ip-scale 1.0       (сильнее переносит личность клиента)\n"
               "    и проверьте wipe_method в логе: 'geometric' — самый грубый, "
               "возможно, маска головы (illustrations_mask) неточная.")
@@ -425,10 +631,13 @@ def main() -> None:
 
     with open(out_dir / "result.json", "w", encoding="utf-8") as f:
         json.dump({
-            "variant": "v3_collage_controlnet",
+            "variant": "v3.1_collage_controlnet_plusv2",
             "image": str(image_path), "client": str(client_path),
             "mask": str(mask_path), "crop_box": [x1, y1, x2, y2],
-            "faceid": FACEID_WEIGHTS, "controlnet": CONTROLNET_TILE_ID,
+            "faceid_version": cfg.faceid_version,
+            "base_model": cfg.base_model or SDXL_INPAINT_ID,
+            "controlnet": CONTROLNET_TILE_ID,
+            "person": person_desc,
             "align_method": col.align_method, "hair_pasted": col.hair_pasted,
             "face_preserved": col.face_preserved, "wipe_method": col.wipe_method,
             "paste_face": bool(args.paste_face), "hair": args.hair,
@@ -436,7 +645,8 @@ def main() -> None:
             "ip_scale": cfg.ip_scale, "control_scale": cfg.control_scale,
             "strength": cfg.strength, "steps": cfg.steps,
             "guidance": cfg.guidance, "gen_size": cfg.gen_size,
-            "seam_dilate": cfg.seam_dilate, "mask_blur": cfg.mask_blur,
+            "seam_dilate": cfg.seam_dilate, "paste_dilate": cfg.paste_dilate,
+            "mask_blur": cfg.mask_blur,
             "lora": cfg.lora_path, "lora_scale": cfg.lora_scale,
             "candidates": [{"seed": c["seed"], "similarity": c["similarity"],
                             "path": c["path"]} for c in candidates],
