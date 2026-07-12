@@ -31,9 +31,6 @@ huggingface_hub>=0.23
 insightface>=0.7.3
 onnxruntime-gpu>=1.17     # на машине без CUDA заменить на: onnxruntime
 
-# --- сегментация головы на иллюстрации (этап построения маски) ---
-sam2 @ git+https://github.com/facebookresearch/sam2.git
-
 # --- детекция лица на иллюстрации (RetinaFace, тянет tensorflow) ---
 retina-face>=0.0.17
 tf-keras                  # совместимость retina-face с tensorflow>=2.16
