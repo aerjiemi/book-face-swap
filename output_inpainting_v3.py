@@ -1,5 +1,21 @@
 """
-Этап 3 пайплайна, ВАРИАНТ 3.1: двухэтапный пайплайн (коллаж -> инпейнт + ControlNet).
+Этап 3 пайплайна, ВАРИАНТ 3.2: двухэтапный пайплайн (коллаж -> инпейнт + ControlNet)
++ финальная заливка "нимба" фоном (background_fill, LaMa).
+
+Изменения относительно v3.1:
+
+7) ЭТАП 3 — фикс "нимба-пустоты" внутри старого контура персонажа.
+   Прежний фикс (п.3, разведение gen/paste масок) убирал ореол СНАРУЖИ
+   старого контура. Но если голова клиента получается МЕНЬШЕ головы
+   исходного персонажа, внутри старого контура остаётся кольцо
+   перегенерированного псевдо-фона — оно лежит ВНУТРИ paste-маски и
+   параметрами seam/paste_dilate не лечится. Теперь после генерации:
+     - face-parsing сегментирует НОВУЮ голову на готовом кадре
+       (защищаются лицо, волосы, уши, ШЕЯ и одежда — не изменяются);
+     - нимб = paste-регион минус защищённая зона;
+     - нимб заливается LaMa (big-lama) — моделью заполнения фона,
+       которая продолжает мазки окружения без промпта.
+   Отключить: --no-bg-fill. Требует: pip install simple-lama-inpainting.
 
 Изменения относительно v3 (по итогам тестов на 3090/4090):
 
@@ -15,9 +31,9 @@
    для взрослых в negative добавляется "child, baby face, ...".
    Переопределить: --person "40 year old bearded man"; отключить: --person "".
 
-3) Фикс "нимба" вокруг головы. Раньше маска ГЕНЕРАЦИИ (расширенная на
-   seam_dilate) использовалась и для финальной ВКЛЕЙКИ — кольцо
-   перегенерированного фона (чуть другого цвета) вклеивалось поверх
+3) Фикс "нимба" вокруг головы (внешнего). Раньше маска ГЕНЕРАЦИИ
+   (расширенная на seam_dilate) использовалась и для финальной ВКЛЕЙКИ —
+   кольцо перегенерированного фона (чуть другого цвета) вклеивалось поверх
    оригинала и было видно как ореол. Теперь маски разведены:
      - генерация: регион + seam_dilate (модели нужен запас на швы);
      - вклейка:   регион + paste_dilate (по умолчанию 6px, почти впритык).
@@ -51,6 +67,7 @@
   --hair          текст про причёску (англ.) — опционально, но помогает;
   --person        описание клиента для промпта (по умолчанию авто по
                   возрасту/полу из InsightFace; --person "" отключает);
+  --no-bg-fill    отключить этап 3 (заливку нимба фоном через LaMa);
   --control-scale вес ControlNet Tile (0.3..0.5); больше = точнее форма
                   волос и пропорции лица, но фактура "фотографичнее";
   --paste-dilate  запас вклейки в px (кроп gen_size); больше = мягче шов,
@@ -59,7 +76,8 @@
 
 !!! Требует предрасчитанной маски (illustrations_mask.py).
 Первый запуск докачает: ControlNet Tile (~2.5GB), face-parsing (~340MB),
-IP-Adapter FaceID PlusV2 (~1.3GB), CLIP image encoder ViT-H (~2.5GB).
+IP-Adapter FaceID PlusV2 (~1.3GB), CLIP image encoder ViT-H (~2.5GB),
+LaMa big-lama (~200MB, для этапа 3).
 """
 
 from __future__ import annotations
@@ -77,6 +95,7 @@ from PIL import Image
 
 from illustrations_mask import PROJECT_ROOT, ILLUSTRATIONS_DIR, MASKS_DIR
 from hair_collage import make_collage_for
+from background_fill import BackgroundFiller
 
 OUTPUTS_DIR = PROJECT_ROOT / "data" / "outputs"
 
@@ -96,6 +115,7 @@ CROP_MARGIN = 0.4   # запас контекста вокруг зоны инп
 
 # {person} подставляется в main (авто по возрасту/полу либо --person)
 DEFAULT_PROMPT = (
+    "continuous background seamlessly matching the original image, exact same art style and colors as surroundings, perfectly integrated scene, "
     "painted portrait of a {person}, in the exact art style of the artwork, "
     "visible brush strokes, illustration, highly detailed face and eyes, "
     "correct natural facial proportions, "
@@ -104,6 +124,7 @@ DEFAULT_PROMPT = (
     "seamlessly integrated into the scene"
 )
 DEFAULT_NEGATIVE = (
+    "plain background, solid color background, studio background, empty space, halo, vignette, "
     "photo, photorealistic, photographic skin, photographic hair texture, "
     "smooth skin, airbrushed, plastic skin, 3d render, vector, flat shading, "
     "elongated face, long face, narrow face, distorted proportions, "
@@ -117,22 +138,23 @@ DEFAULT_NEGATIVE = (
 @dataclass(frozen=True)
 class InpaintConfig:
     lora_path: str | None = None   # путь к style LoRA
-    lora_scale: float = 0.5
+    lora_scale: float = 0.7
     ip_scale: float = 1.0          # сила identity (FaceID), 0.6..1.0
     faceid_lora_scale: float = 0.9 # вес вспомогательной LoRA FaceID
-    control_scale: float = 0.35    # вес ControlNet Tile, 0.3..0.5
-    strength: float = 0.86         # 1.0 = полностью перерисовать зону
-    steps: int = 30
+    control_scale: float = 0.35  # вес ControlNet Tile, 0.3..0.5
+    strength: float = 0.95         # 1.0 = полностью перерисовать зону
+    steps: int = 35
     guidance: float = 4.5
-    seeds: int = 3                 # сколько кандидатов сгенерировать
+    seeds: int = 5                 # сколько кандидатов сгенерировать
     base_seed: int = 42
     gen_size: int = 1024           # рабочее разрешение (SDXL обучен на 1024!)
-    mask_blur: int = 12            # размытие краёв масок (px в кропе gen_size)
-    seam_dilate: int = 28          # запас маски ГЕНЕРАЦИИ на швы (px, gen_size)
-    paste_dilate: int = 6          # запас маски ВКЛЕЙКИ (px, gen_size). Мало
+    mask_blur: int = 8         # размытие краёв масок (px в кропе gen_size)
+    seam_dilate: int = 64        # запас маски ГЕНЕРАЦИИ на швы (px, gen_size)
+    paste_dilate: int = 2         # запас маски ВКЛЕЙКИ (px, gen_size). Мало
                                    # = нет "нимба"; много = мягче шов, но ореол
     faceid_version: str = "plusv2" # "plusv2" | "v1"
-    base_model: str | None = None  # другой SDXL-чекпоинт вместо inpaint
+    base_model: str | None = "SG161222/RealVisXL_V5.0"  # другой SDXL-чекпоинт вместо inpaint
+    bg_fill: bool = True           # этап 3: заливка нимба фоном (LaMa)
     prompt: str = DEFAULT_PROMPT
     negative: str = DEFAULT_NEGATIVE
 
@@ -408,8 +430,9 @@ def make_grid(candidates: list[dict], crop_box, out_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Вариант 3.1: коллаж волос клиента + SDXL inpaint "
-                    "(IP-Adapter FaceID PlusV2 + ControlNet Tile).")
+        description="Вариант 3.2: коллаж волос клиента + SDXL inpaint "
+                    "(IP-Adapter FaceID PlusV2 + ControlNet Tile) "
+                    "+ заливка нимба фоном (LaMa).")
     parser.add_argument("--image", required=True, help="Иллюстрация.")
     parser.add_argument("--client", required=True, help="Фото клиента.")
     parser.add_argument("--hair", default="",
@@ -427,6 +450,9 @@ def main() -> None:
                              "RunDiffusion/Juggernaut-XL-v9 или "
                              "SG161222/RealVisXL_V5.0. По умолчанию "
                              "diffusers/sdxl-inpainting.")
+    parser.add_argument("--no-bg-fill", action="store_true",
+                        help="Отключить этап 3: заливку 'нимба' вокруг "
+                             "головы фоном (LaMa).")
     parser.add_argument("--seeds", type=int, default=None)
     parser.add_argument("--ip-scale", type=float, default=None)
     parser.add_argument("--faceid-lora-scale", type=float, default=None,
@@ -462,6 +488,8 @@ def main() -> None:
         overrides["faceid_version"] = args.faceid
     if args.base_model is not None:
         overrides["base_model"] = args.base_model
+    if args.no_bg_fill:
+        overrides["bg_fill"] = False
     if args.lora is not None:
         overrides["lora_path"] = args.lora
     if args.lora_scale is not None:
@@ -528,7 +556,7 @@ def main() -> None:
     side = x2 - x1
     print(f"Кроп вокруг зоны: [{x1},{y1},{x2},{y2}] ({side}px) -> {cfg.gen_size}px")
 
-    # ДВЕ маски (фикс "нимба"):
+    # ДВЕ маски (фикс внешнего "нимба"):
     #   gen_mask   — что перерисовывает модель (широкий запас на швы);
     #   paste_mask — что вклеиваем в оригинал (почти впритык к голове).
     # Кольцо перегенерированного фона между ними ОТБРАСЫВАЕТСЯ — вокруг
@@ -560,6 +588,18 @@ def main() -> None:
     if cfg.faceid_version == "plusv2":
         setup_faceid_plusv2(pipe, client_bgr, cface, device, dtype)
     id_embeds = faceid_embeds_for_pipe(ref_embed, device, dtype)
+
+    # =========== ЭТАП 3 (подготовка): заливка нимба фоном (LaMa) ===========
+    # Кольцо между новой (меньшей) головой и старым контуром персонажа лежит
+    # ВНУТРИ paste-маски — там диффузия рисует псевдо-фон ("нимб").
+    # BackgroundFiller: face-parsing защищает лицо/волосы/ШЕЮ/одежду нового
+    # персонажа, остаток региона заливается LaMa настоящим фоном.
+    bg_filler = None
+    if cfg.bg_fill:
+        print("Этап 3: загрузка face-parsing + LaMa для заливки нимба...")
+        bg_filler = BackgroundFiller(device)
+    else:
+        print("Этап 3 (заливка нимба) отключён (--no-bg-fill).")
 
     out_dir = OUTPUTS_DIR / f"{stem}__{client_path.stem}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -603,17 +643,27 @@ def main() -> None:
         blended = alpha_full * gen_bgr.astype(np.float32) + (1 - alpha_full) * region
         composed[y1:y2, x1:x2] = blended.astype(np.uint8)
 
+        # ==================== ЭТАП 3: ЗАЛИВКА НИМБА =========================
+        bg_status = "disabled"
+        halo_mask = None
+        if bg_filler is not None:
+            composed, halo_mask, bg_status = bg_filler(composed, paste_mask_full)
+            print(f"  заливка нимба: {bg_status}")
+
         sim = face_similarity(face_app, composed[y1:y2, x1:x2], ref_embed)
         print(f"  similarity={sim:.2f}" + ("  (лицо не найдено!)" if sim < 0 else ""))
 
         cand_path = out_dir / f"candidate_{seed}.png"
         cv2.imwrite(str(cand_path), composed)
         candidates.append({"seed": seed, "similarity": sim,
-                           "image_bgr": composed, "path": str(cand_path)})
+                           "image_bgr": composed, "path": str(cand_path),
+                           "bg_status": bg_status, "halo_mask": halo_mask})
 
     best = max(candidates, key=lambda c: c["similarity"])
     best_path = out_dir / "best.png"
     cv2.imwrite(str(best_path), best["image_bgr"])
+    if best.get("halo_mask") is not None:
+        cv2.imwrite(str(out_dir / "bg_fill_mask.png"), best["halo_mask"])
 
     # quality gate: если лучший кандидат без детектируемого лица — это симптом
     # "лицо слилось с фоном". Явно сигналим и подсказываем, что крутить.
@@ -631,7 +681,7 @@ def main() -> None:
 
     with open(out_dir / "result.json", "w", encoding="utf-8") as f:
         json.dump({
-            "variant": "v3.1_collage_controlnet_plusv2",
+            "variant": "v3.2_collage_controlnet_plusv2_bgfill",
             "image": str(image_path), "client": str(client_path),
             "mask": str(mask_path), "crop_box": [x1, y1, x2, y2],
             "faceid_version": cfg.faceid_version,
@@ -641,6 +691,7 @@ def main() -> None:
             "align_method": col.align_method, "hair_pasted": col.hair_pasted,
             "face_preserved": col.face_preserved, "wipe_method": col.wipe_method,
             "paste_face": bool(args.paste_face), "hair": args.hair,
+            "bg_fill": cfg.bg_fill,
             "prompt": cfg.prompt, "negative": cfg.negative,
             "ip_scale": cfg.ip_scale, "control_scale": cfg.control_scale,
             "strength": cfg.strength, "steps": cfg.steps,
@@ -649,12 +700,15 @@ def main() -> None:
             "mask_blur": cfg.mask_blur,
             "lora": cfg.lora_path, "lora_scale": cfg.lora_scale,
             "candidates": [{"seed": c["seed"], "similarity": c["similarity"],
-                            "path": c["path"]} for c in candidates],
+                            "path": c["path"], "bg_fill": c["bg_status"]}
+                           for c in candidates],
             "best_seed": best["seed"], "best_similarity": best["similarity"],
+            "best_bg_fill": best["bg_status"],
             "best_path": str(best_path),
         }, f, ensure_ascii=False, indent=2)
 
-    print(f"\nЛучший seed: {best['seed']} (similarity={best['similarity']:.2f})")
+    print(f"\nЛучший seed: {best['seed']} (similarity={best['similarity']:.2f}, "
+          f"нимб: {best['bg_status']})")
     print(f"Итог:   {best_path}")
     print(f"Коллаж: {out_dir / 'collage.png'}")
     print(f"Сетка:  {grid_path}")
