@@ -1,40 +1,39 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Установка одной командой:
-#     pip install -r requirments.txt
+# Зависимости проекта
 #
-#   Если после установки torch.cuda.is_available() == False или снова ругается
-#   на sm_120 — pip подтянул не ту сборку torch. Тогда поставь torch отдельно
-#   ПЕРВОЙ командой, а потом уже остальное:
-#       pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-#       pip install -r requirments.txt
-#   Проверка: python -c "import torch; print(torch.cuda.get_device_name(0))"
+# Порядок установки:
+#   1) Сначала PyTorch под вашу CUDA:
+#        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   2) Затем всё остальное:
+#        pip install -r requirements.txt
+#
+# Первый запуск пайплайна дополнительно скачает веса моделей (~9-10 GB):
+#   SDXL-чекпоинт (~7GB), ControlNet Tile (~2.5GB), SAM2.1-large (~900MB),
+#   face-parsing SegFormer (~340MB), IP-Adapter FaceID PlusV2 (~1.3GB),
+#   CLIP ViT-H image encoder (~2.5GB), buffalo_l (~300MB), RetinaFace (~100MB).
+# ============================================================================
 
---extra-index-url https://download.pytorch.org/whl/cu128
+# --- ядро ---
+torch>=2.3.1
+torchvision>=0.18.1
+numpy>=1.26,<2.0          # insightface/onnxruntime конфликтуют с numpy 2.x
+opencv-python>=4.9
+pillow>=10.0
 
-torch>=2.7.0
-torchvision
-torchaudio
+# --- диффузия (этапы 2-3: SDXL inpaint + ControlNet + IP-Adapter) ---
+diffusers>=0.29
+transformers>=4.41        # также SegFormer face-parsing и CLIP encoder
+accelerate>=0.30
+safetensors>=0.4
+peft>=0.11                # загрузка LoRA (FaceID LoRA / style LoRA)
+huggingface_hub>=0.23
 
+# --- лица: детекция, landmarks, ArcFace identity, пол/возраст ---
+insightface>=0.7.3
+onnxruntime-gpu>=1.17     # на машине без CUDA заменить на: onnxruntime
 
-numpy<2
-
-
-opencv-python-headless
-retina-face
-
-
-insightface
-onnxruntime-gpu
+# --- сегментация головы на иллюстрации (этап построения маски) ---
 sam2 @ git+https://github.com/facebookresearch/sam2.git
 
-
-
-
-diffusers>=0.28.0
-transformers>=4.40.0
-accelerate>=0.30.0
-peft>=0.11.0
-safetensors
-pillow
-tf-keras
-simple-lama-inpainting
+# --- детекция лица на иллюстрации (RetinaFace, тянет tensorflow) ---
+retina-face>=0.0.17
+tf-keras                  # совместимость retina-face с tensorflow>=2.16

@@ -1,172 +1,257 @@
 """
-Этап 3 пайплайна (финализация): убираем "нимб" вокруг новой головы.
-
-Проблема: предрасчитанная маска головы (illustrations_mask) повторяет контур
-ИСХОДНОГО персонажа. Если голова клиента получилась меньше / другой формы,
-внутри старого контура остаётся кольцо перегенерированного псевдо-фона
-("нимб"): в коллаже это место было затёрто cv2.inpaint (Telea), ControlNet
-Tile честно воспроизводит эту кашу, а paste-маска (= старый контур) вклеивает
-её в оригинал. Регулировкой seam_dilate/paste_dilate это НЕ лечится:
-кольцо лежит ВНУТРИ paste-маски, а не снаружи.
-
-Решение (после генерации, на готовом кадре):
-  1) face-parsing (тот же SegFormer, что в hair_collage) сегментирует
-     НОВУЮ голову на результате. В защиту входят: кожа лица, волосы, уши,
-     глаза/брови/губы, головной убор и — критично — ШЕЯ (классы neck,
-     neck_l) и ОДЕЖДА (cloth). Эти пиксели не меняются ни при каких условиях.
-  2) нимб = paste-регион МИНУС защищённая зона (с запасом на края волос).
-  3) нимб заливается LaMa (big-lama) — специализированная модель
-     заполнения фона: продолжает текстуру/мазки окружения без промпта,
-     без диффузии и без риска дорисовать "лишнее".
-
-Гарантии безопасности:
-  - лицо/волосы/шея/одежда не изменяются вообще (жёсткая защитная маска);
-  - вне paste-региона кадр не трогается (там и так оригинальные пиксели);
-  - если парсинг новой головы неубедителен (<30% региона) — заливка
-    пропускается и кадр возвращается как есть (безопасный no-op),
-    чтобы случайно не стереть голову.
-
-Зависимость: pip install simple-lama-inpainting
-(первый запуск скачает веса big-lama, ~200MB).
-
-Standalone-отладка на уже сгенерированном кандидате:
-  python background_fill.py \
-      --image  data/outputs/spread_01__ivan/candidate_42.png \
-      --region data/outputs/spread_01__ivan/paste_mask.png
+background_fill.py  — заливка "нимба" вокруг новой головы одним
+SDXL-inpaint проходом. Геометрическая детекция нимба
 """
 
 from __future__ import annotations
 
-import argparse
-from pathlib import Path
-
 import cv2
 import numpy as np
+import torch
 
-from hair_collage import build_face_parser, _parse_labels
+MIN_HALO_FRAC = 0.005   # кольцо меньше 0.5% региона — заливать нечего
+MIN_HEAD_FRAC = 0.25    # парсинг должен покрыть >= 25% старой головы,
+                        # иначе считаем его проваленным и не рискуем лицом
+SKIN_COLOR_DELTA = 30   # страховка подбородка: |пиксель - медианный цвет
+                        # кожи| < delta (по максимальному каналу) -> защита
+SKIN_GUARD_BAND_FRAC = 0.12  # ширина полосы skin-страховки вокруг
+                             # распарсенной головы (доля от размера региона)
 
-# всё, что принадлежит новому персонажу и НЕ должно затираться фоном
-PROTECT_LABELS = {
+# классы face-parsing (CelebAMask-HQ), которые НИКОГДА не закрашиваются
+PROTECTED_CLASSES = {
     "skin", "nose", "l_eye", "r_eye", "l_brow", "r_brow", "eye_g",
-    "u_lip", "l_lip", "mouth", "l_ear", "r_ear", "ear_r",
-    "hair", "hat",
-    "neck", "neck_l",   # ШЕЯ — главное требование: не терять
-    "cloth",            # воротник/плечи, если попали в регион
+    "u_lip", "l_lip", "mouth", "l_ear", "r_ear", "ear_r", "hair",
+    "neck", "neck_l", "cloth", "hat",
 }
 
-HALO_PAD_FRAC = 0.25      # запас кропа вокруг региона для парсинга
-MIN_PROTECT_FRAC = 0.30   # ниже — считаем, что парсинг провалился (no-op)
-MIN_HALO_FRAC = 0.01      # нимб меньше 1% региона — заливать нечего
+
+def _ellipse(size: int) -> np.ndarray:
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
 
-def build_lama(device: str):
-    """LaMa (big-lama) через simple-lama-inpainting."""
-    import torch
-    from simple_lama_inpainting import SimpleLama
-    return SimpleLama(device=torch.device(device))
-
-
-def _protect_mask(image_bgr: np.ndarray, region_mask: np.ndarray,
-                  parser) -> np.ndarray:
-    """Маска НОВОЙ головы (лицо+волосы+уши+шея+одежда) на готовом кадре.
-
-    Парсим кроп вокруг региона (zoom повышает надёжность SegFormer),
-    результат мапим обратно в полный кадр.
-    """
-    h, w = image_bgr.shape[:2]
-    ys, xs = np.where(region_mask > 0)
-    if len(xs) == 0:
-        return np.zeros((h, w), np.uint8)
-
-    pad = int(HALO_PAD_FRAC * max(xs.max() - xs.min(), ys.max() - ys.min()))
-    x1 = max(0, int(xs.min()) - pad); y1 = max(0, int(ys.min()) - pad)
-    x2 = min(w, int(xs.max()) + pad); y2 = min(h, int(ys.max()) + pad)
-
-    labels_map = _parse_labels(image_bgr[y1:y2, x1:x2], parser)
-    id2label = parser[2]
-    wanted_ids = [i for i, name in id2label.items() if name in PROTECT_LABELS]
-    crop_protect = np.isin(labels_map, wanted_ids).astype(np.uint8) * 255
-
-    # закрываем мелкие дыры (блики на волосах/коже)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    crop_protect = cv2.morphologyEx(crop_protect, cv2.MORPH_CLOSE, kernel)
-
-    protect = np.zeros((h, w), np.uint8)
-    protect[y1:y2, x1:x2] = crop_protect
-    return protect
+def _fill_holes(mask_u8: np.ndarray) -> np.ndarray:
+    """Заливает полностью замкнутые дыры внутри маски (флудфилл от угла)."""
+    h, w = mask_u8.shape
+    flood = mask_u8.copy()
+    ff = np.zeros((h + 2, w + 2), np.uint8)
+    seed = None
+    for c in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)):
+        if mask_u8[c[1], c[0]] == 0:
+            seed = c
+            break
+    if seed is None:
+        return mask_u8
+    cv2.floodFill(flood, ff, seed, 255)
+    return cv2.bitwise_or(mask_u8, cv2.bitwise_not(flood))
 
 
 class BackgroundFiller:
-    """Заливка нимба. Грузит SegFormer + LaMa один раз, дальше — по кадру."""
+    """Заливка нимба одним SDXL-inpaint проходом по кольцу вокруг головы."""
 
-    def __init__(self, device: str):
+    def __init__(self, device: str, pipe,
+                 gen_size: int = 1024,
+                 strength: float = 1.0,
+                 steps: int = 40,
+                 guidance: float = 6.0,
+                 control_scale: float = 0.0,
+                 protect_grow_frac: float = 0.04,
+                 halo_grow_px: int = 12,
+                 restore_ip_scale: float = 1.0,
+                 parser=None):
         self.device = device
-        self.parser = build_face_parser(device)
-        self.lama = build_lama(device)
+        self.pipe = pipe
+        self.gen_size = gen_size
+        self.strength = strength
+        self.steps = steps
+        self.guidance = guidance
+        self.control_scale = control_scale
+        self.protect_grow_frac = protect_grow_frac
+        self.halo_grow_px = halo_grow_px
+        self._restore_ip_scale = restore_ip_scale
+        self._ref_embed_shape = None
+        self.parser = parser
 
-    def __call__(self, image_bgr: np.ndarray, region_mask: np.ndarray
-                 ) -> tuple[np.ndarray, np.ndarray, str]:
-        """Возвращает (кадр_после_заливки, маска_нимба, статус).
+        self.prompt = (
+            "seamless continuation of the surrounding background, canvas texture, "
+            "same art style, same colors, visible thick brush strokes as the "
+            "surrounding oil painting, coherent background scenery, no person, no face")
+        self.negative = (
+            "face, head, portrait, person, eyes, hair, skin, neck, halo, glow, ring, "
+            "vignette, bright outline, seam, border, smooth flat blob, grey mask, "
+            "blurry, low quality, artifact, photo, photorealistic, plastic")
 
-        Статусы: "lama" | "skipped_parse_failed" | "skipped_no_halo".
-        При любом skip кадр возвращается без изменений.
+    def set_ref_embed_shape(self, shape) -> None:
+        self._ref_embed_shape = tuple(shape)
+
+    # ------------------------- защита новой головы ---------------------------
+
+    def _parsed_protection(self, image_bgr: np.ndarray, region255: np.ndarray
+                           ) -> tuple[np.ndarray, np.ndarray]:
+        """Маски (защищаемая голова, кожа) новой головы на готовом кадре.
+
+        Парсинг делается на зум-кропе вокруг региона: SegFormer на
+        стилизованном лице в полном кадре ненадёжен (это и было причиной
+        пропадающих подбородков). Результат ограничивается окрестностью
+        региона, чтобы не цеплять других персонажей сцены.
         """
+        from hair_collage import _parse_labels, _labels_to_mask
+
         h, w = image_bgr.shape[:2]
-        region = ((region_mask > 0).astype(np.uint8)) * 255
-        region_area = max(int((region > 0).sum()), 1)
+        ys, xs = np.where(region255 > 0)
+        pad = int(0.30 * max(xs.max() - xs.min(), ys.max() - ys.min())) + 8
+        cx1, cy1 = max(0, int(xs.min()) - pad), max(0, int(ys.min()) - pad)
+        cx2, cy2 = min(w, int(xs.max()) + pad), min(h, int(ys.max()) + pad)
 
-        protect = _protect_mask(image_bgr, region, self.parser)
+        labels_map = _parse_labels(image_bgr[cy1:cy2, cx1:cx2], self.parser)
+        id2label = self.parser[2]
+        parsed_c = _labels_to_mask(labels_map, id2label, PROTECTED_CLASSES)
+        skin_c = _labels_to_mask(labels_map, id2label, {"skin"})
 
-        # sanity: если внутри региона защищено слишком мало — парсинг
-        # скорее всего не увидел голову; заливать опасно (сотрём персонажа)
-        protect_in_region = cv2.bitwise_and(protect, region)
-        if int((protect_in_region > 0).sum()) < MIN_PROTECT_FRAC * region_area:
-            print("[background_fill] парсинг новой головы неубедителен — "
-                  "заливка нимба пропущена (кадр не изменён).")
-            return image_bgr, np.zeros((h, w), np.uint8), "skipped_parse_failed"
+        parsed = np.zeros((h, w), np.uint8)
+        skin = np.zeros((h, w), np.uint8)
+        parsed[cy1:cy2, cx1:cx2] = parsed_c
+        skin[cy1:cy2, cx1:cx2] = skin_c
 
-        # защиту слегка расширяем, чтобы не съесть тонкие пряди и край шеи
-        grow = max(3, int(0.015 * np.sqrt(region_area)))
-        kg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                       (2 * grow + 1, 2 * grow + 1))
-        protect_grown = cv2.dilate(protect, kg)
+        guard = cv2.dilate(region255, _ellipse(31))
+        parsed = cv2.bitwise_and(parsed, guard)
+        skin = cv2.bitwise_and(skin, guard)
 
-        halo = cv2.subtract(region, protect_grown)
-        # убираем однопиксельный мусор по границе
-        halo = cv2.morphologyEx(
-            halo, cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        # сшиваем разрывы и заливаем дыры (глаза/блики) — внутри лица
+        # "фона" быть не может по определению
+        parsed = cv2.morphologyEx(parsed, cv2.MORPH_CLOSE, _ellipse(9))
+        parsed = _fill_holes(parsed)
+        return parsed, skin
+
+    # --------------------------- SDXL-inpaint --------------------------------
+
+    def _run_inpaint(self, crop_bgr: np.ndarray, halo_crop: np.ndarray) -> np.ndarray:
+        """SDXL-inpaint по маске halo_crop (identity выключен на время прохода)."""
+        from PIL import Image
+
+        gs = self.gen_size
+        h0, w0 = crop_bgr.shape[:2]
+
+        crop_rgb = cv2.resize(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB),
+                              (gs, gs), interpolation=cv2.INTER_LANCZOS4)
+        mask_gs = cv2.resize(halo_crop, (gs, gs), interpolation=cv2.INTER_NEAREST)
+        mask_gs = cv2.GaussianBlur(mask_gs, (11, 11), 0)
+
+        pil_image = Image.fromarray(crop_rgb)
+        pil_control = Image.fromarray(crop_rgb)
+        pil_mask = Image.fromarray(mask_gs)
+
+        shape = self._ref_embed_shape or (2, 1, 512)
+        zero_embeds = torch.zeros(
+            shape, device=torch.device(self.device),
+            dtype=(torch.float16 if self.device == "cuda" else torch.float32))
+
+        try:
+            self.pipe.set_ip_adapter_scale(0.0)
+            gen = torch.Generator(device="cpu").manual_seed(42)
+            result = self.pipe(
+                prompt=self.prompt,
+                negative_prompt=self.negative,
+                image=pil_image,
+                mask_image=pil_mask,
+                control_image=pil_control,
+                controlnet_conditioning_scale=0.0,
+                ip_adapter_image_embeds=[zero_embeds],
+                strength=self.strength,
+                num_inference_steps=self.steps,
+                guidance_scale=self.guidance,
+                generator=gen,
+                height=gs, width=gs,
+            ).images[0]
+        finally:
+            self.pipe.set_ip_adapter_scale(self._restore_ip_scale)
+
+        out = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
+        return cv2.resize(out, (w0, h0), interpolation=cv2.INTER_LANCZOS4)
+
+    # ------------------------------ основной вызов ---------------------------
+
+    def __call__(self, image_bgr: np.ndarray, region_mask: np.ndarray,
+                 head_region: np.ndarray | None = None
+                 ) -> tuple[np.ndarray, np.ndarray, str]:
+        """image_bgr    — кадр после основной генерации;
+        region_mask  — paste-регион (старая голова + небольшой запас);
+        head_region  — маска старой головы (для оценки провала парсинга).
+        """
+        if self.parser is None:
+            from hair_collage import build_face_parser
+            self.parser = build_face_parser(self.device)
+
+        h, w = image_bgr.shape[:2]
+        region255 = ((region_mask > 0).astype(np.uint8)) * 255
+        region_area = max(int((region255 > 0).sum()), 1)
+        head_area = (max(int((head_region > 0).sum()), 1)
+                     if head_region is not None else region_area)
+        empty = np.zeros((h, w), np.uint8)
+
+        # --- 1. защита: face-parsing НОВОЙ головы (зум-кроп) ---
+        parsed, skin = self._parsed_protection(image_bgr, region255)
+
+        # fail-safe: парсинг провалился -> не рисковать лицом, нимб оставить
+        inside = cv2.bitwise_and(parsed, region255)
+        if int((inside > 0).sum()) < MIN_HEAD_FRAC * head_area:
+            return image_bgr, empty, "skipped_parse_failed"
+
+        # --- 2. расширение защиты (protect_grow_frac от размера региона) ---
+        ys, xs = np.where(region255 > 0)
+        size = max(int(xs.max() - xs.min()), int(ys.max() - ys.min()), 1)
+        protect_px = max(3, int(round(self.protect_grow_frac * size)))
+        protection = cv2.dilate(parsed, _ellipse(2 * protect_px + 1))
+
+        # --- 3. доп. цветовой фильтр-СТРАХОВКА
+        if skin.any():
+            med = np.median(image_bgr[skin > 0].reshape(-1, 3), axis=0)
+            diff = np.abs(image_bgr.astype(np.int16)
+                          - med.astype(np.int16)).max(axis=2)
+            skin_like = ((diff < SKIN_COLOR_DELTA).astype(np.uint8)) * 255
+            band_px = max(3 * protect_px,
+                          int(round(SKIN_GUARD_BAND_FRAC * size)))
+            band = cv2.dilate(parsed, _ellipse(2 * band_px + 1))
+            skin_guard = cv2.bitwise_and(skin_like, band)
+            protection = cv2.bitwise_or(
+                protection, cv2.bitwise_and(skin_guard, region255))
+        protection = _fill_holes(protection)
+
+        # --- 4. нимб = регион МИНУС защита (геометрически, без цвета) ---
+        halo = cv2.subtract(region255, protection)
+        halo = cv2.morphologyEx(halo, cv2.MORPH_OPEN, _ellipse(3))
+
+        # настоящее кольцо всегда касается внешней границы региона;
+        # изолированные "дыры" парсера внутри лица — не нимб, не трогаем
+        border = cv2.subtract(region255, cv2.erode(region255, _ellipse(7)))
+        num, lab, _stats, _ = cv2.connectedComponentsWithStats(
+            (halo > 0).astype(np.uint8), connectivity=8)
+        if num > 1:
+            keep = [i for i in range(1, num)
+                    if np.any((lab == i) & (border > 0))]
+            halo = (np.isin(lab, keep).astype(np.uint8)) * 255
+
         if int((halo > 0).sum()) < MIN_HALO_FRAC * region_area:
             return image_bgr, halo, "skipped_no_halo"
 
-        # маску ГЕНЕРАЦИИ LaMa чуть расширяем наружу (в настоящий фон),
-        # чтобы заливка перекрыла шов старого контура; в голову — нельзя
-        halo_gen = cv2.dilate(halo, cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (9, 9)))
-        halo_gen = cv2.subtract(halo_gen, protect)
+        # --- 5. маска генерации: расширяем кольцо, но защиту не трогаем ---
+        halo_gen = cv2.dilate(halo, _ellipse(2 * self.halo_grow_px + 1))
+        halo_gen = cv2.subtract(halo_gen, protection)
 
-        # кроп вокруг нимба (LaMa быстрее и качественнее на локальном кропе)
         ys, xs = np.where(halo_gen > 0)
-        pad = int(0.30 * max(xs.max() - xs.min(), ys.max() - ys.min())) + 16
+        if len(ys) == 0:
+            return image_bgr, halo, "skipped_empty_mask"
+
+        pad = int(0.35 * max(xs.max() - xs.min(), ys.max() - ys.min())) + 32
         cx1 = max(0, int(xs.min()) - pad); cy1 = max(0, int(ys.min()) - pad)
         cx2 = min(w, int(xs.max()) + pad); cy2 = min(h, int(ys.max()) + pad)
 
-        from PIL import Image
-        crop = image_bgr[cy1:cy2, cx1:cx2]
-        crop_mask = halo_gen[cy1:cy2, cx1:cx2]
-        pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-        pil_mask = Image.fromarray(crop_mask)
+        filled_crop = self._run_inpaint(image_bgr[cy1:cy2, cx1:cx2],
+                                        halo_gen[cy1:cy2, cx1:cx2])
 
-        result = self.lama(pil_img, pil_mask)
-        filled_crop = cv2.cvtColor(np.array(result.convert("RGB")),
-                                   cv2.COLOR_RGB2BGR)
-        # simple-lama паддит вход до кратности 8 — обрезаем обратно
-        filled_crop = filled_crop[:crop.shape[0], :crop.shape[1]]
-
-        # мягкая вклейка СТРОГО по маске нимба; на защищённой зоне alpha=0,
-        # поэтому лицо/волосы/шея/одежда физически не могут измениться
-        alpha = cv2.GaussianBlur(crop_mask, (7, 7), 0).astype(np.float32) / 255.0
-        alpha[protect[cy1:cy2, cx1:cx2] > 0] = 0.0
+        # --- 6. вклейка: альфа жёстко обнулена на каждом пикселе защиты ---
+        alpha = cv2.GaussianBlur(halo_gen[cy1:cy2, cx1:cx2],
+                                 (7, 7), 0).astype(np.float32) / 255.0
+        alpha[protection[cy1:cy2, cx1:cx2] > 0] = 0.0
         alpha = alpha[..., None]
 
         out = image_bgr.copy()
@@ -175,43 +260,4 @@ class BackgroundFiller:
             alpha * filled_crop.astype(np.float32) + (1.0 - alpha) * base
         ).astype(np.uint8)
 
-        return out, halo, "lama"
-
-
-# ----------------------------- standalone-отладка ----------------------------
-
-def main() -> None:
-    import torch
-
-    cli = argparse.ArgumentParser(
-        description="Заливка 'нимба' вокруг головы фоном (LaMa), этап 3.")
-    cli.add_argument("--image", required=True,
-                     help="Готовый кадр (candidate_*.png / best.png).")
-    cli.add_argument("--region", required=True,
-                     help="paste_mask.png из папки результата.")
-    cli.add_argument("--out", default=None,
-                     help="Куда сохранить (default: <image>_bgfill.png).")
-    args = cli.parse_args()
-
-    image_path = Path(args.image)
-    image = cv2.imread(str(image_path))
-    region = cv2.imread(args.region, cv2.IMREAD_GRAYSCALE)
-    if image is None or region is None:
-        raise FileNotFoundError("Не удалось прочитать кадр или paste-маску.")
-    if region.shape[:2] != image.shape[:2]:
-        raise ValueError("Размеры кадра и paste-маски не совпадают.")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    filler = BackgroundFiller(device)
-    filled, halo, status = filler(image, region)
-
-    out_path = Path(args.out) if args.out else \
-        image_path.with_name(f"{image_path.stem}_bgfill.png")
-    cv2.imwrite(str(out_path), filled)
-    cv2.imwrite(str(out_path.with_name(out_path.stem + "_halo.png")), halo)
-    print(f"Статус: {status}")
-    print(f"Итог:   {out_path}")
-
-
-if __name__ == "__main__":
-    main()
+        return out, halo_gen, "inpaint"

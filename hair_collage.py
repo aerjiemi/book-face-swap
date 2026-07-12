@@ -1,22 +1,11 @@
 """
 Этап 1 варианта 3 (двухэтапный пайплайн): КОЛЛАЖ волос клиента на заготовку.
 
-Идея: геометрию и цвет причёски мы НЕ доверяем диффузии, а закладываем руками
-до инпейнта. Тогда на этапе 2 модель должна только "перерисовать в стиле",
-а не "придумать волосы".
 
 Что делает модуль:
 1) Сегментация волос на фото клиента.
-   Используется face-parsing (SegFormer, класс "hair"), а не SAM:
-   SAM не знает семантику "волосы" и требует точек-подсказок,
-   face-parsing выдаёт маску волос напрямую и очень надёжен на
-   качественных фото клиентов. Работает и для лысых/коротких стрижек
-   (маска просто будет маленькой — это обрабатывается).
-2) Выравнивание головы клиента к голове персонажа:
-   5 точек лица клиента (InsightFace kps) -> 5 точек лица персонажа,
-   similarity-преобразование (масштаб + поворот + сдвиг),
-   cv2.estimateAffinePartial2D. Если лицо персонажа на иллюстрации
-   не детектируется — грубый fallback по bbox предрасчитанной маски.
+   Используется face-parsing (SegFormer, класс "hair")
+2) Выравнивание головы клиента к голове персонажа
 3) "Чистая заготовка": область исходных лица+волос персонажа затирается
    cv2.inpaint (Telea). Это важно: иначе ControlNet на этапе 2 будет
    "видеть" СТАРЫЕ волосы персонажа и тянуть их обратно в кадр.
@@ -25,9 +14,6 @@
    может помочь ControlNet с геометрией, но обычно лицо лучше оставить
    целиком на откуп IP-Adapter FaceID.
 
-Standalone-отладка (сохраняет collage/маски в data/outputs/_collage_debug):
-  python hair_collage.py --image data/illustrations/spread_01.png \
-                         --client data/clients/ivan.jpg
 """
 
 from __future__ import annotations
@@ -41,7 +27,6 @@ import numpy as np
 
 FACE_PARSING_ID = "jonathandinu/face-parsing"
 
-# имена классов из id2label модели face-parsing (CelebAMask-HQ)
 HAIR_LABELS = {"hair"}
 FACE_LABELS = {"skin", "nose", "l_eye", "r_eye", "l_brow", "r_brow",
                "eye_g", "u_lip", "l_lip", "mouth", "l_ear", "r_ear"}
@@ -191,16 +176,7 @@ def _best_face_for_mask(faces, mask_full: np.ndarray):
 def align_transform(face_app, client_bgr: np.ndarray, client_face,
                     illus_bgr: np.ndarray, mask_full: np.ndarray
                     ) -> tuple[np.ndarray, str, np.ndarray | None]:
-    """Similarity-преобразование "фото клиента -> иллюстрация".
-
-    Основной путь: 5 kps клиента -> 5 kps персонажа.
-    Fallback (лицо на иллюстрации не нашлось): масштабируем bbox лица клиента
-    в нижние ~2/3 bbox маски (лицо обычно под волосами) — грубо, но рабоче.
-
-    Возвращает (M, method, char_face_bbox). char_face_bbox — bbox лица
-    персонажа на иллюстрации (или None), нужен чтобы защитить лицо от
-    затирания в коллаже даже когда парсинг волос провалился.
-    """
+    """Similarity-преобразование "фото клиента -> иллюстрация". """
     illus_faces = face_app.get(illus_bgr)
     target = _best_face_for_mask(illus_faces, mask_full) if illus_faces else None
     char_bbox = target.bbox.astype(np.float32) if target is not None else None
@@ -233,18 +209,7 @@ def align_transform(face_app, client_bgr: np.ndarray, client_face,
 def hair_wipe_region(mask_full: np.ndarray, char_hair: np.ndarray | None,
                      char_parse_ok: bool, char_face_bbox: np.ndarray | None
                      ) -> tuple[np.ndarray, str]:
-    """Регион для затирания = ТОЛЬКО волосы персонажа. Лицо всегда защищено.
-
-    Три уровня надёжности (лицо не затирается ни в одном):
-      1) "parse"     — face-parsing выделил волосы персонажа (лучший случай);
-      2) "face_bbox" — парсинг не сработал, но InsightFace нашёл лицо персонажа:
-                       защищаем прямоугольник лица, волосы = маска минус лицо;
-      3) "geometric" — не сработало ничего: защищаем нижние ~60% маски головы
-                       (там обычно лицо), затираем только верхнюю часть (волосы).
-
-    Именно уровни 2-3 закрывают старый баг "лицо слилось с фоном": раньше при
-    провале парсинга затиралась ВСЯ голова, и модель дорисовывала лицо из
-    контекста (динозавр/лес). Теперь живописное лицо остаётся как ref для Tile.
+    """Регион для затирания = ТОЛЬКО волосы персонажа.
     """
     h, w = mask_full.shape[:2]
     kernel15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
@@ -286,12 +251,7 @@ def build_collage(illus_bgr: np.ndarray, mask_full: np.ndarray,
                   char_face_bbox: np.ndarray | None = None,
                   paste_face: bool = False,
                   feather_px: int = 5) -> CollageResult:
-    """Заготовка с ЖИВОПИСНЫМ лицом персонажа + волосы клиента поверх.
 
-    Вариант B: НЕ затираем лицо персонажа (оно нужно ControlNet Tile как
-    texture-reference — иначе лицо перерисовывается в гладкий "пластик" или
-    сливается с фоном). Затираем ТОЛЬКО волосы персонажа.
-    """
     h, w = illus_bgr.shape[:2]
 
     wipe, wipe_method = hair_wipe_region(mask_full, char_hair, char_parse_ok,
